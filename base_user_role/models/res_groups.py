@@ -8,15 +8,17 @@ class ResGroups(models.Model):
     def _get_light_group_xmlids(self):
         """Treat role groups as light groups.
 
-        Role groups are created dynamically and therefore do not have a
-        declarative XML ID.  Odoo's helper creates stable custom XML IDs for
-        such groups so they can be included in the regular-group calculation.
+        A role group is only a container of the groups implied by the role,
+        like ``base.default_user_group``: it must not turn its users into
+        regular users by itself. The light/regular tier of a user is then
+        decided by the groups implied by its roles.
+
+        Role groups are created dynamically and may have no XML ID, so their
+        database ids are returned instead: ``SetDefinitions.get_id()``
+        resolves both XML IDs and ids.
         """
-        xmlids = super()._get_light_group_xmlids()
-        role_groups = (
-            self.env["res.users.role"].sudo().search([], limit=1000).mapped("group_id")
-        )
-        return (*xmlids, *role_groups._ensure_xml_id().values())
+        role_groups = self.sudo().search([("role_id", "!=", False)])
+        return (*super()._get_light_group_xmlids(), *role_groups.ids)
 
     view_access = fields.Many2many(
         groups="base.group_system",
