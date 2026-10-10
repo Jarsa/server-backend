@@ -128,15 +128,22 @@ class TestUserRole(TestUserRoleCommon):
         roles, not from the role group itself.
         """
         group_regular = self.env.ref("base.group_user_regular")
-        self.assertEqual(self.user_id.role, "light_user")
+        # The default user template may imply regular groups once other apps
+        # are installed, so start from a user carrying the internal group only.
+        user = self.user_model.create(
+            {
+                "name": "USER TEST (LIGHT ROLES)",
+                "login": "user_test_light_roles",
+                "group_ids": [Command.set([self.group_user_id.id])],
+            }
+        )
+        self.assertEqual(user.role, "light_user")
         # ROLE_1 only implies light groups: the user stays light
         self.assertTrue(self.role1_id.group_id._is_light_groups())
         self.assertNotIn(self.role1_id.group_id, group_regular.implied_by_ids)
         self.assertNotIn(group_regular, self.role1_id.implied_ids)
-        self.user_id.write(
-            {"role_line_ids": [Command.create({"role_id": self.role1_id.id})]}
-        )
-        self.assertEqual(self.user_id.role, "light_user")
+        user.write({"role_line_ids": [Command.create({"role_id": self.role1_id.id})]})
+        self.assertEqual(user.role, "light_user")
         # A role implying a regular group makes the user regular
         group_partner_manager = self.env.ref("base.group_partner_manager")
         self.assertFalse(group_partner_manager._is_light_groups())
@@ -150,10 +157,8 @@ class TestUserRole(TestUserRoleCommon):
         )
         self.assertTrue(regular_role.group_id._is_light_groups())
         self.assertNotIn(regular_role.group_id, group_regular.implied_by_ids)
-        self.user_id.write(
-            {"role_line_ids": [Command.create({"role_id": regular_role.id})]}
-        )
-        self.assertEqual(self.user_id.role, "regular_user")
+        user.write({"role_line_ids": [Command.create({"role_id": regular_role.id})]})
+        self.assertEqual(user.role, "regular_user")
         # Once the role is deleted its group is a plain group again
         group = regular_role.group_id
         regular_role.unlink()
