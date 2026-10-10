@@ -2,6 +2,8 @@
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 import datetime
 
+from lxml import etree
+
 from odoo import fields
 from odoo.exceptions import AccessError
 from odoo.fields import Command
@@ -118,6 +120,59 @@ class TestUserRole(TestUserRoleCommon):
         self.assertIn(access, self.role1_id.model_access_ids)
         action = self.role1_id.show_model_access_ids()
         self.assertIn(access.id, action["domain"][0][2])
+
+    def test_role_group_is_light(self):
+        """A role group is a container: it must not make its users regular.
+
+        The light/regular tier of a user comes from the groups implied by its
+        roles, not from the role group itself.
+        """
+        group_regular = self.env.ref("base.group_user_regular")
+        self.assertEqual(self.user_id.role, "light_user")
+        # ROLE_1 only implies light groups: the user stays light
+        self.assertTrue(self.role1_id.group_id._is_light_groups())
+        self.assertNotIn(self.role1_id.group_id, group_regular.implied_by_ids)
+        self.assertNotIn(group_regular, self.role1_id.implied_ids)
+        self.user_id.write(
+            {"role_line_ids": [Command.create({"role_id": self.role1_id.id})]}
+        )
+        self.assertEqual(self.user_id.role, "light_user")
+        # A role implying a regular group makes the user regular
+        group_partner_manager = self.env.ref("base.group_partner_manager")
+        self.assertFalse(group_partner_manager._is_light_groups())
+        regular_role = self.role_model.create(
+            {
+                "name": "ROLE_REGULAR",
+                "implied_ids": [
+                    Command.set([self.group_user_id.id, group_partner_manager.id])
+                ],
+            }
+        )
+        self.assertTrue(regular_role.group_id._is_light_groups())
+        self.assertNotIn(regular_role.group_id, group_regular.implied_by_ids)
+        self.user_id.write(
+            {"role_line_ids": [Command.create({"role_id": regular_role.id})]}
+        )
+        self.assertEqual(self.user_id.role, "regular_user")
+        # Once the role is deleted its group is a plain group again
+        group = regular_role.group_id
+        regular_role.unlink()
+        self.assertTrue(group.exists())
+        self.assertFalse(group._is_light_groups())
+        self.assertIn(group, group_regular.implied_by_ids)
+
+    def test_user_form_role_readonly(self):
+        """The native role radio is read-only when the user has role lines."""
+        self.assertFalse(self.user_id.has_role_lines)
+        self.user_id.write(
+            {"role_line_ids": [Command.create({"role_id": self.role1_id.id})]}
+        )
+        self.assertTrue(self.user_id.has_role_lines)
+        view = self.user_id.get_view(self.env.ref("base.view_users_form").id)
+        arch = etree.fromstring(view["arch"])
+        node = arch.xpath("//page[@name='access_rights']//field[@name='role']")
+        self.assertEqual(len(node), 1)
+        self.assertEqual(node[0].get("readonly"), "has_role_lines")
 
     def test_role_1_2(self):
         self.user_id.write(
@@ -299,9 +354,8 @@ class TestUserRole(TestUserRoleCommon):
         # Check that the role has the same groups as the user
         role_id = result["res_id"]
         role = self.role_model.browse([role_id])
-        regular_group_id = self.env.ref("base.group_user_regular").id
-        user_group_ids = set(self.user_id.group_ids.ids) - {regular_group_id}
-        role_group_ids = set(role.implied_ids.ids) - {regular_group_id}
+        user_group_ids = sorted(set(self.user_id.group_ids.ids))
+        role_group_ids = sorted(set(role.implied_ids.ids))
         self.assertEqual(user_group_ids, role_group_ids)
 
     def test_show_alert_computation(self):
@@ -316,13 +370,11 @@ class TestUserRole(TestUserRoleCommon):
         self.assertFalse(self.user_id.show_alert)
 
     def test_group_groups_into_role(self):
-        selected_group_ids = self.user_id.group_ids.ids
-        regular_group_id = self.env.ref("base.group_user_regular").id
-        user_group_ids = set(selected_group_ids) - {regular_group_id}
+        user_group_ids = self.user_id.group_ids.ids
         # Check that there is not a role with name: Test Role
         self.assertFalse(self.role_model.search([("name", "=", "Test Role")]))
         # Call create_role function to group groups into a role
-        wizard = self.wiz_model.with_context(active_ids=selected_group_ids).create(
+        wizard = self.wiz_model.with_context(active_ids=user_group_ids).create(
             {"name": "Test Role"}
         )
         res = wizard.create_role()
@@ -330,8 +382,8 @@ class TestUserRole(TestUserRoleCommon):
         new_role = self.env[res["res_model"]].browse(res["res_id"])
         self.assertEqual(new_role.name, "Test Role")
         # Check that the role has the correct groups (even if the order is not equal)
-        role_group_ids = set(new_role.implied_ids.ids) - {regular_group_id}
-        self.assertEqual(role_group_ids, user_group_ids)
+        role_group_ids = set(new_role.implied_ids.ids)
+        self.assertEqual(role_group_ids, set(user_group_ids))
 
 
 @tagged("post_install", "-at_install")
