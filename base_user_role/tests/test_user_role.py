@@ -1,19 +1,23 @@
 # Copyright 2014 ABF OSIELL <http://osiell.com>
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
+import base64
 import datetime
+import time
+from unittest.mock import patch
 
 from odoo import fields
 from odoo.exceptions import AccessError
-from odoo.tests.common import TransactionCase
+from odoo.fields import Command
+from odoo.tests import tagged
+
+from odoo.addons.base.models.res_users import ResUsers as BaseResUsers
+from odoo.addons.base.tests.common import BaseCommon
 
 
-class TestUserRole(TransactionCase):
+class TestUserRoleCommon(BaseCommon):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.env = cls.env(
-            context=dict(cls.env.context, tracking_disable=True, no_reset_password=True)
-        )
         cls.user_model = cls.env["res.users"]
         cls.role_model = cls.env["res.users.role"]
         cls.wiz_model = cls.env["wizard.groups.into.role"]
@@ -86,6 +90,9 @@ class TestUserRole(TransactionCase):
             }
         )
 
+
+@tagged("post_install", "-at_install")
+class TestUserRole(TestUserRoleCommon):
     def test_role_1(self):
         self.user_id.write(
             {"role_line_ids": [fields.Command.create({"role_id": self.role1_id.id})]}
@@ -208,7 +215,39 @@ class TestUserRole(TransactionCase):
             {"name": "USER TEST (DEFAULT ROLES)", "login": "user_test_default_roles"}
         )
         roles = self.role_model.browse([self.role1_id.id, self.role2_id.id])
-        self.assertEqual(user.role_ids, roles)
+        self.assertEqual(user.user_role_ids, roles)
+
+    def test_group_multi_company_write_link(self):
+        group = self.env.ref("base.group_multi_company")
+        self.assertNotIn(
+            group,
+            self.multicompany_user_2.group_ids,
+            "should not have base.group_multi_company",
+        )
+        self.multicompany_user_2.write(
+            {"company_ids": [Command.link(self.company1.id)]}
+        )
+        self.assertIn(
+            group,
+            self.multicompany_user_2.group_ids,
+            "should have base.group_multi_company",
+        )
+
+    def test_group_multi_company_write_unlink(self):
+        group = self.env.ref("base.group_multi_company")
+        self.assertIn(
+            group,
+            self.multicompany_user_1.group_ids,
+            "should have base.group_multi_company",
+        )
+        self.multicompany_user_1.write(
+            {"company_ids": [Command.unlink(self.company2.id)]}
+        )
+        self.assertNotIn(
+            group,
+            self.multicompany_user_1.group_ids,
+            "should not have base.group_multi_company",
+        )
 
     def test_role_multicompany(self):
         """Test AccessError when admin-like user accesses a role"""
@@ -275,3 +314,147 @@ class TestUserRole(TransactionCase):
         self.assertEqual(new_role.name, "Test Role")
         # Check that the role has the correct groups (even if the order is not equal)
         self.assertEqual(set(new_role.implied_ids.ids), set(user_group_ids))
+
+
+@tagged("post_install", "-at_install")
+class TestUserRoleMail(TestUserRoleCommon):
+    def test_notification_type_not_reset(self):
+        """Test that roles don't reset notification settings."""
+        if self.env["ir.module.module"]._get("mail").state != "installed":
+            self.skipTest("Mail module is not installed.")
+        notification_group = self.env.ref("mail.group_mail_notification_type_inbox")
+        self.assertNotIn(notification_group, self.user_id.group_ids)
+        self.user_id.notification_type = "inbox"
+        self.assertIn(notification_group, self.user_id.group_ids)
+        self.user_id.write(
+            {"role_line_ids": [Command.create({"role_id": self.role1_id.id})]}
+        )
+        self.assertIn(notification_group, self.user_id.group_ids)
+
+    def test_notification_type_not_forced(self):
+        """Test that a role implying the inbox group does not force it.
+
+        The notification type is a preference of the user, not of their roles:
+        picking "Handle by Emails" removes the group, and the sync used to hand
+        it straight back within the same write, so the stored value computed
+        from it went back to ``inbox`` and the choice could not be made at all.
+        """
+        if self.env["ir.module.module"]._get("mail").state != "installed":
+            self.skipTest("Mail module is not installed.")
+        notification_group = self.env.ref("mail.group_mail_notification_type_inbox")
+        role = self.role_model.create(
+            {
+                "name": "ROLE_INBOX",
+                "implied_ids": [
+                    Command.set([self.group_user_id.id, notification_group.id])
+                ],
+            }
+        )
+        self.user_id.write({"role_line_ids": [Command.create({"role_id": role.id})]})
+        self.user_id.write({"notification_type": "inbox"})
+        self.assertEqual(self.user_id.notification_type, "inbox")
+
+        self.user_id.write({"notification_type": "email"})
+        self.assertEqual(self.user_id.notification_type, "email")
+
+        self.user_id.write({"name": "USER TEST (ROLES) renamed"})
+        self.assertEqual(self.user_id.notification_type, "email")
+
+    def _create_role_with_self_writable_group(self):
+        return self.role_model.create(
+            {
+                "name": "ROLE_SELF_WRITABLE",
+                "implied_ids": [
+                    Command.set(
+                        [
+                            self.group_user_id.id,
+                            self.env.ref("base.group_multi_company").id,
+                        ]
+                    )
+                ],
+            }
+        )
+
+    def test_self_writable_group_no_group_write(self):
+        """A role implying a self-writable group must not cause a group write
+        on every user write.
+
+        A ``group_ids`` write on ``res.users`` clears the whole environment
+        cache, which can drop values that are not saved yet (see the 2FA test
+        below).
+        """
+        role = self._create_role_with_self_writable_group()
+        self.user_id.write({"role_line_ids": [Command.create({"role_id": role.id})]})
+        with patch.object(
+            BaseResUsers, "write", autospec=True, side_effect=BaseResUsers.write
+        ) as base_write:
+            self.user_id.write({"name": "USER TEST (ROLES) renamed"})
+        group_writes = [
+            call for call in base_write.call_args_list if "group_ids" in call.args[1]
+        ]
+        self.assertFalse(group_writes, "Unexpected group_ids write on res.users")
+
+    def test_totp_secret_kept_with_self_writable_group(self):
+        """Enabling 2FA must keep the secret when a role implies a
+        self-writable group.
+
+        auth_totp's ``_inverse_token()`` writes ``totp_last_counter`` before
+        it reads ``totp_secret``. A group write in between cleared the cache,
+        and the secret was saved as NULL.
+        """
+        if self.env["ir.module.module"]._get("auth_totp").state != "installed":
+            self.skipTest("auth_totp module is not installed.")
+        from odoo.addons.auth_totp.models.totp import TIMESTEP, hotp
+
+        role = self._create_role_with_self_writable_group()
+        self.user_id.write({"role_line_ids": [Command.create({"role_id": role.id})]})
+        key = b"base_user_role_totp_"  # 20 bytes
+        secret = base64.b32encode(key).decode()
+        code = hotp(key, int(time.time() / TIMESTEP))
+        user = self.user_id.with_user(self.user_id)
+        self.assertTrue(user._totp_try_setting(secret, code))
+        self.env.cr.execute(
+            "SELECT totp_secret FROM res_users WHERE id = %s", (self.user_id.id,)
+        )
+        self.assertTrue(self.env.cr.fetchone()[0], "2FA secret was not saved")
+
+    def test_notification_type_reset(self):
+        """When user is demoted to share user, update notification settings.
+
+        The issue only occurs when the writing user is not the superuser, and
+        if an intermittent flush is triggered by for instance
+        `_check_one_user_type` in website's res.users override. This triggers
+        constraint res_users_notification_type as Odoo has not yet recomputed
+        this at that point.
+        """
+        # Notification settings depend on mail being installed
+        if self.env["ir.module.module"]._get("mail").state != "installed":
+            self.skipTest("Mail module is not installed.")
+
+        # Set up a non-superuser user
+        admin_user = self.env["res.users"].create(
+            {
+                "name": "Some admin",
+                "login": "admin@example.com",
+            },
+        )
+        admin_user.group_ids += self.env.ref("base.group_system")
+
+        self.user_id.write(
+            {
+                "role_line_ids": [Command.create({"role_id": self.role1_id.id})],
+                "notification_type": "inbox",
+            },
+        )
+
+        # As non-superuser, delete all roles from the user
+        user = self.user_id.with_user(admin_user)
+        user.write(
+            {
+                "role_line_ids": [
+                    Command.delete(rl.id) for rl in self.user_id.role_line_ids
+                ],
+            },
+        )
+        # Database constraint has not been triggered
+        self.assertEqual(user.notification_type, "email")

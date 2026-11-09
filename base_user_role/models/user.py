@@ -21,10 +21,10 @@ class ResUsers(models.Model):
         for user in self:
             user.show_alert = user.role_line_ids.filtered(lambda rec: rec.is_enabled)
 
-    role_ids = fields.One2many(
+    user_role_ids = fields.One2many(
         comodel_name="res.users.role",
-        string="User Roles",
-        compute="_compute_role_ids",
+        string="Roles",
+        compute="_compute_user_role_ids",
         compute_sudo=True,
         groups="base.group_erp_manager",
     )
@@ -42,9 +42,9 @@ class ResUsers(models.Model):
         return [{"role_id": r.id} for r in default_roles]
 
     @api.depends("role_line_ids.role_id")
-    def _compute_role_ids(self):
+    def _compute_user_role_ids(self):
         for user in self:
-            user.role_ids = user.role_line_ids.mapped("role_id")
+            user.user_role_ids = user.role_line_ids.mapped("role_id")
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -60,6 +60,15 @@ class ResUsers(models.Model):
     def _get_enabled_roles(self):
         return self.role_line_ids.filtered(lambda rec: rec.is_enabled)
 
+    @api.model
+    def _get_self_writable_groups(self):
+        groups = self.env.ref("base.group_multi_company")
+        if group := self.env.ref(
+            "mail.group_mail_notification_type_inbox", raise_if_not_found=False
+        ):
+            groups |= group
+        return groups
+
     def set_groups_from_roles(self, force=False):
         """Set (replace) the groups following the roles defined on users.
         If no role is defined on the user, its groups are let untouched unless
@@ -71,14 +80,20 @@ class ResUsers(models.Model):
         for role in self.mapped("role_line_ids.role_id"):
             # v19: use transitive implied groups provided by ORM
             role_groups[role] = list(set(role.all_implied_ids.ids))
+        self_writable_group_ids = self._get_self_writable_groups().ids
         for user in self:
             if not user.role_line_ids and not force:
                 continue
-            group_ids = []
+            user_group_ids = set(user.group_ids.ids).difference(self_writable_group_ids)
+            group_ids = set()
             for role_line in user._get_enabled_roles():
                 role = role_line.role_id
-                group_ids += role_groups[role]
-            group_ids = list(set(group_ids))  # Remove duplicates IDs
+                group_ids.update(role_groups[role])
+            # Self-writable groups are the user's own to set: excluding them
+            # from the user's side only keeps the sync from taking them away,
+            # while a role implying one would still hand it back on every
+            # write, silently overriding the user's choice.
+            group_ids.difference_update(self_writable_group_ids)
             # Preserve admin only if dropping it would leave zero administrators
             admin_group = self.env.ref("base.group_system", raise_if_not_found=False)
             if (
@@ -90,13 +105,23 @@ class ResUsers(models.Model):
                     [("id", "!=", user.id), ("group_ids", "in", admin_group.id)]
                 )
                 if other_admins == 0:
-                    group_ids.append(admin_group.id)
-            groups_to_add = list(set(group_ids) - set(user.group_ids.ids))
-            groups_to_remove = list(set(user.group_ids.ids) - set(group_ids))
+                    group_ids.add(admin_group.id)
+            groups_to_add = group_ids - user_group_ids
+            groups_to_remove = user_group_ids - group_ids
             to_add = [fields.Command.link(gr) for gr in groups_to_add]
             to_remove = [fields.Command.unlink(gr) for gr in groups_to_remove]
             groups = to_remove + to_add
             if groups:
-                vals = {"group_ids": groups}
+                # Prevent tiggering res_users_notification_type for share users
+                vals = {}
+                if (
+                    self.env.ref("base.group_user").id in groups_to_remove
+                    and "notification_type" in user._fields
+                    and user.notification_type == "inbox"
+                ):
+                    vals["notification_type"] = "email"
+                    pass
+
+                vals["group_ids"] = groups
                 super(ResUsers, user).write(vals)
         return True
